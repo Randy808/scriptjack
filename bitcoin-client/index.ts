@@ -1,6 +1,11 @@
 import { JSONRPCClient } from "json-rpc-2.0";
 import fetch from "node-fetch";
-import { AddressInfoResponse, MempoolEntry, MempoolInfo } from "./module";
+import {
+  AddressInfoResponse,
+  MempoolEntry,
+  MempoolInfo,
+  Txout,
+} from "./module";
 
 var client = new JSONRPCClient(function (jsonRPCRequest: any) {
   return fetch("http://admin1:123@localhost:18885", {
@@ -70,7 +75,19 @@ export default class BitcoinClient {
 
   async getAddressInfo(address: string): Promise<AddressInfoResponse> {
     return client.request("getaddressinfo", {
-      address
+      address,
+    });
+  }
+
+  async getTxOut(
+    txid: string,
+    n: number,
+    includeMempool: boolean = true
+  ): Promise<Txout> {
+    return client.request("gettxout", {
+      txid,
+      n,
+      include_mempool: includeMempool,
     });
   }
 

@@ -16,3 +16,7 @@ export interface AddressInfoResponse {
   ismine?: boolean;
   error?: string;
 }
+
+export interface Txout {
+  value: number;
+}

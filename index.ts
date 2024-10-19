@@ -1,9 +1,10 @@
 import { Transaction, TxOutput as Output } from "bitcoinjs-lib";
 import BitcoinClient from "./bitcoin-client";
 import * as bitcoinjs from "bitcoinjs-lib";
-
+import { getEligibleInputs } from "./utils";
+import logger from "./logger";
+import { MempoolEntry, Txout } from "./bitcoin-client/module";
 const zmq = require("zeromq");
-const winston = require("winston");
 
 const ZEROMQ_PORT = 8089;
 const NETWORK = bitcoinjs.networks.regtest;
@@ -11,28 +12,7 @@ const NETWORK = bitcoinjs.networks.regtest;
 // -maxtxfee on Bitcoin node must be set to a large value
 const client = new BitcoinClient();
 
-let logger = winston.createLogger();
-
-if (process.env.NODE_ENV === "dev") {
-  logger = winston.createLogger({
-    level: "debug",
-  });
-
-  logger.add(
-    new winston.transports.Console({
-      format: winston.format.simple(),
-    })
-  );
-}
-
-async function tryToRbf(tx: Transaction) {
-  const keyOperations = [
-    "OP_CHECKSIG",
-    "OP_CHECKSIGVERIFY",
-    "OP_CHECKMULTISIG",
-    "OP_CHECKSIGADD",
-  ];
-
+export async function tryToRbf(tx: Transaction) {
   let outputAddress = bitcoinjs.address.fromOutputScript(
     tx.outs[0].script,
     NETWORK
@@ -44,49 +24,61 @@ async function tryToRbf(tx: Transaction) {
     return;
   }
 
-  let witnessScript;
+  let eligibleInputs = await getEligibleInputs(tx);
 
+  if (eligibleInputs.length === 0) {
+    logger.debug(`No eligible inputs, skipping tx ${tx.getId()}`);
+    return;
+  }
+
+  logger.debug(`Capturing tx ${tx.getId()}`);
+
+  // Get fees of curr tx
+  let txoutPromises: Promise<Txout>[] = eligibleInputs.map(async (txin) => {
+    let txid = Buffer.from(txin.hash).reverse().toString("hex");
+    let rawTx = await client.getRawTransaction(txid);
+    return {
+      value: rawTx.vout[txin.index].value,
+    };
+  });
+
+  let txouts = await Promise.all(txoutPromises);
+
+  let inputSumInBitcoin = txouts.reduce(
+    (sum: number, txout: Txout) => sum + txout.value,
+    0
+  );
+
+  let totalOutputValueInSatoshis = BigInt(inputSumInBitcoin * 100_000_000);
+
+  let mempoolTx: MempoolEntry;
   try {
-    // I only check the first input although a more sophisticated solution would look
-    // through each one
-    let witnessStack = tx.ins[0].witness;
-    witnessScript = bitcoinjs.script.toASM(
-      witnessStack[witnessStack.length - 1]
-    );
+    mempoolTx = await client.getMempoolEntry(tx.getId());
   } catch (e) {
-    winston.debug("Invalid witness script, skipping...");
+    logger.debug(`Transaction ${tx.getId()} no longer in mempool, skipping...`);
     return;
   }
-
-  let scriptContainsKeyOperations = keyOperations.some((k) =>
-    witnessScript.includes(k)
-  );
-
-  if (scriptContainsKeyOperations) {
-    logger.debug(
-      "Script contains key operation and cannot be captured, skipping..."
-    );
-    return;
-  }
-
-  logger.debug("TXID:", tx.getId());
-  let mempoolTx = await client.getMempoolEntry(tx.getId());
-  const totalOutputValueInSatoshis = tx.outs.reduce(
-    (sum, curr: Output) => sum + curr.value,
-    BigInt(0)
-  );
 
   let mempoolInfo = await client.getMempoolInfo();
+
+  // TODO: Take vsize from newer, smaller tx
   let minimumFeeBumpInBitcoin = mempoolInfo.minrelaytxfee * mempoolTx.vsize;
   let minimumFeeBumpInSatoshis = BigInt(minimumFeeBumpInBitcoin * 100_000_000);
-  logger.debug("minimum fee bump", minimumFeeBumpInSatoshis);
+  logger.debug(`Minimum fee bump ${minimumFeeBumpInSatoshis}`);
 
   let totalFeeInSatoshis =
     BigInt(mempoolTx.fees.base * 100_000_000) + minimumFeeBumpInSatoshis;
-  logger.debug("Total fee:", totalFeeInSatoshis);
+  logger.debug(`Total fee: ${totalFeeInSatoshis}`);
+
+  const DUST = 546;
+  // Make sure value of eligible inputs is greater than fees
+  if (totalOutputValueInSatoshis - totalFeeInSatoshis < BigInt(DUST)) {
+    logger.debug("Capture is not economically viable, skipping...");
+    return;
+  }
 
   let address = await client.getNewAddress();
-
+  tx.ins = eligibleInputs;
   tx.outs = [
     {
       // Subtracting from existing output will implicitly include old fee
@@ -95,7 +87,7 @@ async function tryToRbf(tx: Transaction) {
     },
   ];
 
-  logger.debug("Sending raw transaction:", tx.toHex());
+  logger.debug(`Sending raw transaction: ${tx.toHex()}`);
   let txid = await client.sendRawTransaction(tx.toHex());
   logger.debug(`Successfully submitted transaction ${txid}`);
 }
@@ -109,10 +101,10 @@ async function listenForMempoolTransactions() {
 
   for await (const [topic, msg] of sock) {
     logger.debug(
-      "received a message related to:",
-      topic.toString(),
-      "containing message:",
-      msg.toString("hex")
+      "received a message related to: " +
+        topic.toString() +
+        " containing message: " +
+        msg.toString("hex")
     );
 
     const t: Transaction = bitcoinjs.Transaction.fromHex(msg.toString("hex"));
