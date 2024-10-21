@@ -1,13 +1,12 @@
-import * as bitcoinjs from "bitcoinjs-lib";
 import logger from "./logger";
-import { Transaction } from "bitcoinjs-lib";
+import { script, Transaction, TxInput } from "bitcoinjs-lib";
 
 const ANNEX_DELIMITER = 0x50;
 
 function containsKeylessWitnessScript(
-  input: bitcoinjs.TxInput,
+  input: TxInput,
   _index: number,
-  _array: bitcoinjs.TxInput[]
+  _array: TxInput[]
 ) {
   const keyOperations = [
     "OP_CHECKSIG",
@@ -19,7 +18,7 @@ function containsKeylessWitnessScript(
   let witnessScript;
   try {
     let witnessStack = input.witness;
-    witnessScript = bitcoinjs.script.toASM(
+    witnessScript = script.toASM(
       witnessStack[witnessStack.length - 1]
     );
   } catch (e) {
@@ -42,9 +41,9 @@ function containsKeylessWitnessScript(
 }
 
 function containsWitnessScript(
-  input: bitcoinjs.TxInput,
+  input: TxInput,
   _index: number,
-  _array: bitcoinjs.TxInput[]
+  _array: TxInput[]
 ) {
   let witnessStack = input.witness;
 
@@ -61,8 +60,8 @@ function containsWitnessScript(
   return true;
 }
 
-export async function getEligibleInputs(tx: Transaction) {
-  let eligibleInputs: bitcoinjs.TxInput[] = tx.ins;
+export async function getEligibleInputs(tx: Transaction): Promise<TxInput[]> {
+  let eligibleInputs: TxInput[] = tx.ins;
   eligibleInputs = eligibleInputs.filter(containsWitnessScript);
   eligibleInputs = eligibleInputs.filter(containsKeylessWitnessScript);
   return eligibleInputs;

